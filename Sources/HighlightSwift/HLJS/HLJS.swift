@@ -1,9 +1,18 @@
+import Foundation
 import JavaScriptCore
 
 final actor HLJS {
-    private var hljs: JSValue?
-    
-    private func load() throws -> JSValue {
+    /// The engine state is guarded by `lock`, not by the actor: `highlightSync`
+    /// runs highlight.js on the CALLING thread — a caller that owns its own
+    /// serial queue keeps the evaluation off Swift Concurrency's cooperative
+    /// pool — and the actor-isolated `highlight` takes the same lock, so the
+    /// two entries can never touch the context at once. JavaScriptCore
+    /// serialises access to a virtual machine on its own; the lock is what
+    /// keeps the lazy load and the `hljs` handle consistent across threads.
+    private nonisolated(unsafe) var hljs: JSValue?
+    private nonisolated let lock = NSLock()
+
+    private nonisolated func load() throws -> JSValue {
         if let hljs {
             return hljs
         }
@@ -24,6 +33,15 @@ final actor HLJS {
     }
     
     func highlight(_ text: String, mode: HighlightMode) throws -> HLJSResult {
+        try highlightSync(text, mode: mode)
+    }
+
+    /// Runs highlight.js on the calling thread. Safe from any thread: calls
+    /// serialise on the lock, so one `HLJS` is one engine — use one per queue
+    /// for parallelism.
+    nonisolated func highlightSync(_ text: String, mode: HighlightMode) throws -> HLJSResult {
+        lock.lock()
+        defer { lock.unlock() }
         switch mode {
         case .automatic:
             return try highlightAuto(text)
@@ -38,7 +56,7 @@ final actor HLJS {
         }
     }
     
-    private func highlightAuto(_ text: String) throws -> HLJSResult {
+    private nonisolated func highlightAuto(_ text: String) throws -> HLJSResult {
         let hljs = try load()
         let jsResult = hljs.invokeMethod(
             "highlightAuto",
@@ -47,9 +65,9 @@ final actor HLJS {
         return try highlightResult(jsResult)
     }
     
-    private func highlight(_ text: String,
-                           language: String,
-                           ignoreIllegals: Bool) throws -> HLJSResult {
+    private nonisolated func highlight(_ text: String,
+                                       language: String,
+                                       ignoreIllegals: Bool) throws -> HLJSResult {
         var languageOptions: [String : Any] = [
             "language": language,
         ]
@@ -64,7 +82,7 @@ final actor HLJS {
         return try highlightResult(jsResult)
     }
     
-    private func highlightResult(_ result: JSValue?) throws -> HLJSResult {
+    private nonisolated func highlightResult(_ result: JSValue?) throws -> HLJSResult {
         guard let result else {
             throw HLJSError.valueNotFound
         }

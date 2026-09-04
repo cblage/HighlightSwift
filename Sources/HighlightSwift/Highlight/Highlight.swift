@@ -55,6 +55,31 @@ public final class Highlight: Sendable {
                         mode: HighlightMode = .automatic,
                         colors: HighlightColors = .light(.xcode)) async throws -> HighlightResult {
         let hljsResult = try await hljs.highlight(text, mode: mode)
+        return try result(text, hljsResult: hljsResult, colors: colors)
+    }
+
+    /// Syntax highlight some text and return detailed results, synchronously
+    /// on the calling thread. `request` hops to an actor, which executes on
+    /// Swift Concurrency's cooperative pool, so highlight.js evaluation there
+    /// competes with everything else the pool runs; a caller that owns its own
+    /// queue calls this instead. Calls on one `Highlight` serialise — use one
+    /// instance per queue for parallelism. Not for the main thread.
+    /// - Parameters:
+    ///   - text: The plain text code to highlight.
+    ///   - mode: The highlight mode to use (default: .automatic).
+    ///   - colors: The highlight colors to use (default: .xcode/.light).
+    /// - Throws: Either a HighlightError or an Error.
+    /// - Returns: The result of the syntax highlight.
+    public func requestSync(_ text: String,
+                            mode: HighlightMode = .automatic,
+                            colors: HighlightColors = .light(.xcode)) throws -> HighlightResult {
+        let hljsResult = try hljs.highlightSync(text, mode: mode)
+        return try result(text, hljsResult: hljsResult, colors: colors)
+    }
+
+    private func result(_ text: String,
+                        hljsResult: HLJSResult,
+                        colors: HighlightColors) throws -> HighlightResult {
         let isUndefined = hljsResult.value == "undefined"
         let attributedText: AttributedString
         if isUndefined {
