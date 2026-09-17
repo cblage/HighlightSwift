@@ -67,6 +67,8 @@ let someCSS = """
 let attributedText = try await highlight.attributedText(someCode, colors: .custom(css: someCSS))
 ```
 
+The attributed string is built from highlight.js's markup and the stylesheet's rules directly, on the calling thread: every run of text takes the `color` of the innermost element a rule reaches, its ancestors' otherwise, the `.hljs` root's last, with the cascade's specificity and order among the rules that reach it, and `text-decoration: underline` is kept. Font weight and style are the font you set on the result, and layout properties never reach the text. AppKit's HTML importer is not used: it is a WebKit document load whose parse runs on the main thread whatever thread calls it.
+
 The `.request()` function returns a `HighlightResult` with extra information:
 ```swift
 let result: HighlightResult = try await highlight.request(someCode)
