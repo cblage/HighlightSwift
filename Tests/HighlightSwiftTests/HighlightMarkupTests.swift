@@ -433,4 +433,280 @@ final class HighlightMarkupTests: XCTestCase {
         XCTAssertEqual(overlap, .completed)
         wait(for: [done], timeout: 60)
     }
+
+    /// Independent copy of the `a0d910b` `Character`-delimited markup parser
+    /// used as a reference oracle for inputs without combining/Prepend scalars
+    /// adjacent to ASCII HTML delimiters.
+    private static func referenceA0D910BAttributedString(
+        _ markup: String,
+        stylesheet: HighlightStylesheet
+    ) -> AttributedString {
+        func classes(in tag: Substring) -> [String] {
+            guard let attribute = tag.range(of: "class=") else { return [] }
+            let afterEquals = tag[attribute.upperBound...]
+            guard let quote = afterEquals.first, quote == "\"" || quote == "'" else { return [] }
+            let value = afterEquals.dropFirst()
+            guard let end = value.firstIndex(of: quote) else { return [] }
+            return value[..<end]
+                .split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "\n" })
+                .map(String.init)
+        }
+        func entity(_ name: Substring) -> String? {
+            switch name {
+            case "amp": return "&"
+            case "lt": return "<"
+            case "gt": return ">"
+            case "quot": return "\""
+            case "apos": return "'"
+            case "nbsp": return "\u{00A0}"
+            default:
+                guard name.hasPrefix("#") else { return nil }
+                let number = name.dropFirst()
+                let value: UInt32?
+                if number.hasPrefix("x") || number.hasPrefix("X") {
+                    value = UInt32(number.dropFirst(), radix: 16)
+                } else {
+                    value = UInt32(number)
+                }
+                guard let value, let scalar = Unicode.Scalar(value) else { return nil }
+                return String(Character(scalar))
+            }
+        }
+        let text = markup.trimmingCharacters(in: .whitespacesAndNewlines)
+        let output = NSMutableAttributedString()
+        var elements: [HighlightStylesheet.Element] = [.init(tag: "code", classes: ["hljs"])]
+        var styles: [HighlightStylesheet.Style] = [stylesheet.style(for: elements, inheriting: nil)]
+        var pending = ""
+        func flush() {
+            guard !pending.isEmpty else { return }
+            let style = styles[styles.count - 1]
+            var attributes: [NSAttributedString.Key: Any] = [:]
+            if let color = style.color { attributes[.foregroundColor] = color }
+            if style.underline { attributes[.underlineStyle] = NSUnderlineStyle.single.rawValue }
+            output.append(NSAttributedString(string: pending, attributes: attributes))
+            pending = ""
+        }
+        var index = text.startIndex
+        while index < text.endIndex {
+            let character = text[index]
+            if character == "<", let close = text[index...].firstIndex(of: ">") {
+                let tag = text[text.index(after: index)..<close]
+                if tag.hasPrefix("/") {
+                    if tag.dropFirst().trimmingCharacters(in: .whitespaces) == "span", elements.count > 1 {
+                        flush()
+                        elements.removeLast()
+                        styles.removeLast()
+                    }
+                } else if tag.hasPrefix("span") {
+                    flush()
+                    let element = HighlightStylesheet.Element(tag: "span", classes: classes(in: tag))
+                    elements.append(element)
+                    styles.append(stylesheet.style(for: elements, inheriting: styles[styles.count - 1]))
+                }
+                index = text.index(after: close)
+            } else if character == "&",
+                      let semicolon = text[index...].firstIndex(of: ";"),
+                      text.distance(from: index, to: semicolon) <= 10,
+                      let decoded = entity(text[text.index(after: index)..<semicolon]) {
+                pending.append(decoded)
+                index = text.index(after: semicolon)
+            } else {
+                pending.append(character)
+                index = text.index(after: index)
+            }
+        }
+        flush()
+#if canImport(AppKit)
+        return (try? AttributedString(output, including: \.appKit)) ?? AttributedString(output.string)
+#else
+        return (try? AttributedString(output, including: \.uiKit)) ?? AttributedString(output.string)
+#endif
+    }
+
+    /// The byte tokenizer matches the independent `a0d910b` reference oracle
+    /// across entity lengths, whitespace trimming, Unicode text, CSS cascade,
+    /// and real highlight.js outputs where delimiters are not adjacent to
+    /// combining marks or Prepend scalars.
+    func testTokenizerMatchesA0D910BReferenceAcrossStandardMarkupAndRealHighlightJS() throws {
+        let css = HighlightColors.dark(.xcode).css
+            + ".hljs-link{color:#00aaff;text-decoration:underline}"
+        let colors = HighlightColors.custom(css: css, background: HighlightColors.dark(.xcode).background)
+        let stylesheet = HighlightStylesheet(css: css)
+
+        let rawMarkups: [String] = [
+            "",
+            "   \t\r\n  ",
+            "\u{00A0} \t\u{2028}",
+            "\u{200B}<span class=\"hljs-keyword\">z</span>\u{200B}",
+            "&amp\u{0301};",
+            "&\u{0301}amp;",
+            "&#00000065;",
+            "&#000000065;",
+            "&#x0000041;",
+            "&#x00000041;",
+            "&#+65;",
+            "&bogus; &amp a && b < unclosed",
+            "<span class=\"hljs-keyword\">a</span></\u{0301}span>b",
+            "<span class=\"hljs-keyword\">a</span></\u{200B}span\u{00A0}>b",
+            "π<span class=\"hljs-keyword\">let</span>🚀&amp;π",
+            "\u{2063}\n<span class=\"hljs-keyword\">let</span> x = &amp;1\r\n\u{2063}",
+            #"<span class="hljs-link">url<span class="hljs-unmatched">/path</span></span>"#,
+        ]
+        for markup in rawMarkups {
+            let expected = Self.referenceA0D910BAttributedString(markup, stylesheet: stylesheet)
+            let tokenized = HighlightMarkup.tokenize(markup, stylesheet: stylesheet)
+            let actualAttributed = HighlightMarkup.attributedString(markup, css: css)
+            assertRunInvariants(text: tokenized.text, runs: tokenized.runs, attributed: expected)
+            assertRunInvariants(text: tokenized.text, runs: tokenized.runs, attributed: actualAttributed)
+        }
+
+        let hljs = HLJS()
+        let highlighter = Highlight()
+        let realCases: [(String, HighlightMode)] = [
+            ("//\u{0301}\nlet x = 1", .languageAliasIgnoreIllegal("swift")),
+            ("\u{2063}\n    let π = \"🚀 & <tag>\"\r\n    return π\n\u{2063}", .languageAliasIgnoreIllegal("swift")),
+            ("def f(x):\n    return x & 1", .languageAliasIgnoreIllegal("python")),
+            ("{\"ok\": true, \"emoji\": \"🚀\"}", .languageAliasIgnoreIllegal("json")),
+            ("<a href=\"https://example.com\">hi &amp; bye</a>", .languageAliasIgnoreIllegal("html")),
+            ("@@ -1 +1 @@\n-old\n+new", .languageAliasIgnoreIllegal("diff")),
+        ]
+        for (code, mode) in realCases {
+            let raw = try hljs.highlightSync(code, mode: mode)
+            let expected = raw.value == "undefined"
+                ? AttributedString(stringLiteral: code)
+                : Self.referenceA0D910BAttributedString(raw.value, stylesheet: stylesheet)
+            let runsResult = try highlighter.requestRunsSync(code, mode: mode, colors: colors)
+            let syncResult = try highlighter.requestSync(code, mode: mode, colors: colors)
+            assertRunInvariants(text: runsResult.text, runs: runsResult.runs, attributed: expected)
+            assertRunInvariants(text: runsResult.text, runs: runsResult.runs, attributed: syncResult.attributedText)
+            XCTAssertEqual(NSAttributedString(syncResult.attributedText), NSAttributedString(expected))
+        }
+    }
+
+    /// HTML delimiters (`<`, `>`, `&`, `;`) are ASCII code points, so combining
+    /// marks and Prepend scalars adjacent to them stay text rather than
+    /// suppressing entity decoding or swallowing tag boundaries.
+    func testASCIIDelimitersDecodeAndCloseAcrossAdjacentCombiningMarksAndPrependScalars() throws {
+        let css = HighlightColors.dark(.xcode).css
+            + ".hljs-link{color:#00aaff;text-decoration:underline}"
+        let colors = HighlightColors.custom(css: css, background: HighlightColors.dark(.xcode).background)
+        let stylesheet = HighlightStylesheet(css: css)
+        let rootColor = try XCTUnwrap(stylesheet.rootStyle.color.map(rgbaHex))
+        let keywordColor = try XCTUnwrap(
+            stylesheet.style(
+                for: [HighlightStylesheet.rootElement, .init(tag: "span", classes: ["hljs-keyword"])],
+                inheriting: stylesheet.rootStyle
+            ).color.map(rgbaHex)
+        )
+        let numberColor = try XCTUnwrap(
+            stylesheet.style(
+                for: [HighlightStylesheet.rootElement, .init(tag: "span", classes: ["hljs-number"])],
+                inheriting: stylesheet.rootStyle
+            ).color.map(rgbaHex)
+        )
+
+        // Entity followed by combining/joiner/variation scalars decodes and retains the mark.
+        let entityCases: [(markup: String, expected: String)] = [
+            ("&amp;\u{0301}", "&\u{0301}"),
+            ("&lt;\u{0301}", "<\u{0301}"),
+            ("&gt;\u{0301}", ">\u{0301}"),
+            ("&quot;\u{0301}", "\"\u{0301}"),
+            ("&#65;\u{0301}", "A\u{0301}"),
+            ("&#x27;\u{0301}", "'\u{0301}"),
+            ("&amp;\u{0301};", "&\u{0301};"),
+            ("&amp;\u{200D}", "&\u{200D}"),
+            ("&amp;\u{0903}", "&\u{0903}"),
+            ("&amp;\u{FE0F}", "&\u{FE0F}"),
+            ("\u{0600}&amp;", "\u{0600}&"),
+        ]
+        for entry in entityCases {
+            let tokenized = HighlightMarkup.tokenize(entry.markup, stylesheet: stylesheet)
+            let attributed = HighlightMarkup.attributedString(entry.markup, css: css)
+            XCTAssertEqual(tokenized.text, entry.expected)
+            XCTAssertEqual(tokenized.runs.count, 1)
+            XCTAssertEqual(tokenized.runs[0].foregroundColor.map(rgbaHex), rootColor)
+            assertRunInvariants(text: tokenized.text, runs: tokenized.runs, attributed: attributed)
+        }
+
+        // Tag delimiters close at ASCII `>` and open at ASCII `<` regardless of adjacent marks.
+        let openTagMark = HighlightMarkup.tokenize(
+            "<span class=\"hljs-keyword\">\u{0301}</span>",
+            stylesheet: stylesheet
+        )
+        XCTAssertEqual(openTagMark.text, "\u{0301}")
+        XCTAssertEqual(openTagMark.runs.count, 1)
+        XCTAssertEqual(openTagMark.runs[0].foregroundColor.map(rgbaHex), keywordColor)
+
+        let closeTagMark = HighlightMarkup.tokenize(
+            "<span class=\"hljs-keyword\">x</span>\u{0301}",
+            stylesheet: stylesheet
+        )
+        XCTAssertEqual(closeTagMark.text, "x\u{0301}")
+        XCTAssertEqual(closeTagMark.runs.map(\.text), ["x", "\u{0301}"])
+        XCTAssertEqual(closeTagMark.runs.map { $0.foregroundColor.map(rgbaHex) }, [keywordColor, rootColor])
+
+        let closeTagThenSpan = HighlightMarkup.tokenize(
+            "<span class=\"hljs-keyword\">x</span>\u{0301} <span class=\"hljs-number\">1</span>",
+            stylesheet: stylesheet
+        )
+        XCTAssertEqual(closeTagThenSpan.text, "x\u{0301} 1")
+        XCTAssertEqual(closeTagThenSpan.runs.map(\.text), ["x", "\u{0301} ", "1"])
+        XCTAssertEqual(
+            closeTagThenSpan.runs.map { $0.foregroundColor.map(rgbaHex) },
+            [keywordColor, rootColor, numberColor]
+        )
+
+        let underlineThenZWJ = HighlightMarkup.tokenize(
+            "<span class=\"hljs-link\">x</span>\u{200D}<span class=\"hljs-number\">2</span>",
+            stylesheet: stylesheet
+        )
+        XCTAssertEqual(underlineThenZWJ.text, "x\u{200D}2")
+        XCTAssertEqual(underlineThenZWJ.runs.map(\.text), ["x", "\u{200D}", "2"])
+        XCTAssertEqual(underlineThenZWJ.runs.map(\.isUnderlined), [true, false, false])
+
+        let prependBeforeSpan = HighlightMarkup.tokenize(
+            "\u{0600}<span class=\"hljs-keyword\">x</span>\u{0301}",
+            stylesheet: stylesheet
+        )
+        XCTAssertEqual(prependBeforeSpan.text, "\u{0600}x\u{0301}")
+        XCTAssertEqual(prependBeforeSpan.runs.map(\.text), ["\u{0600}", "x", "\u{0301}"])
+        XCTAssertEqual(
+            prependBeforeSpan.runs.map { $0.foregroundColor.map(rgbaHex) },
+            [rootColor, keywordColor, rootColor]
+        )
+
+        // Real highlight.js text/swift/html inputs round-trip verbatim without text loss.
+        let highlighter = Highlight()
+        let realCases: [(String, HighlightMode)] = [
+            ("&\u{0301}", .languageAliasIgnoreIllegal("text")),
+            ("<\u{0301}", .languageAliasIgnoreIllegal("text")),
+            (">\u{0301}", .languageAliasIgnoreIllegal("text")),
+            ("\"\u{0301}", .languageAliasIgnoreIllegal("text")),
+            ("1\u{0301} + 2", .languageAliasIgnoreIllegal("swift")),
+            ("\"hi\"\u{0301} + 1", .languageAliasIgnoreIllegal("swift")),
+            ("let\u{0301} x = 1", .languageAliasIgnoreIllegal("swift")),
+            ("\u{0600}let x = 1", .languageAliasIgnoreIllegal("swift")),
+            ("\u{0600}&", .languageAliasIgnoreIllegal("text")),
+            ("\u{0600}1", .languageAliasIgnoreIllegal("swift")),
+            ("<b>\u{0301}</b>", .languageAliasIgnoreIllegal("html")),
+            ("\u{2063}\n&\u{0301}\n<\u{0301}\n>\u{0301}\nlet\u{0301} x = 1\n\u{0600}1\n\u{2063}", .languageAliasIgnoreIllegal("swift")),
+        ]
+        for (code, mode) in realCases {
+            let runsResult = try highlighter.requestRunsSync(code, mode: mode, colors: colors)
+            let syncResult = try highlighter.requestSync(code, mode: mode, colors: colors)
+            XCTAssertFalse(runsResult.isUndefined)
+            XCTAssertEqual(runsResult.text, code)
+            assertRunInvariants(text: runsResult.text, runs: runsResult.runs, attributed: syncResult.attributedText)
+        }
+
+        let swiftKeywordMark = try highlighter.requestRunsSync(
+            "let\u{0301} x = 1",
+            mode: .languageAliasIgnoreIllegal("swift"),
+            colors: colors
+        )
+        XCTAssertEqual(swiftKeywordMark.runs.first?.text, "let")
+        XCTAssertEqual(swiftKeywordMark.runs.first?.foregroundColor.map(rgbaHex), keywordColor)
+        XCTAssertEqual(swiftKeywordMark.runs.dropFirst().first?.text, "\u{0301} x = ")
+        XCTAssertEqual(swiftKeywordMark.runs.dropFirst().first?.foregroundColor.map(rgbaHex), rootColor)
+    }
 }
