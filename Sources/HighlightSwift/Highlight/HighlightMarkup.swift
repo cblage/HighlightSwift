@@ -1,72 +1,188 @@
 import Foundation
 #if canImport(AppKit)
 import AppKit
-typealias HighlightPlatformColor = NSColor
+public typealias HighlightPlatformColor = NSColor
 #elseif canImport(UIKit)
 import UIKit
-typealias HighlightPlatformColor = UIColor
+public typealias HighlightPlatformColor = UIColor
 #endif
 
-/// The attributed string, built from highlight.js's markup and the
-/// stylesheet's colour rules directly. highlight.js emits nested
+/// Resolved token runs and attributed strings built from highlight.js's markup
+/// and the stylesheet's colour rules directly. highlight.js emits nested
 /// `<span class="…">` elements around escaped text, and a theme is a flat
 /// list of rules over those classes, so the two are walked here: every run
 /// of text takes the colour of the innermost element a rule reaches, its
-/// ancestors' otherwise, the `.hljs` root's last. AppKit's HTML importer,
-/// which this replaces, is a WebKit document load whose parse runs on the
-/// main thread whatever thread calls it, so a caller on its own queue
-/// parked in the kernel for the parse's whole length while the main
-/// thread paid a quarter second per highlighted block.
+/// ancestors' otherwise, the `.hljs` root's last. AppKit's HTML importer is
+/// never used.
 enum HighlightMarkup {
+    struct Tokenized {
+        let text: String
+        let runs: [HighlightRun]
+    }
+
+    /// Tokenizes highlight.js's `markup` under `stylesheet` into decoded plain
+    /// text and coalesced non-empty runs in UTF-16 order without touching
+    /// `NSAttributedString`, `AttributedString`, or `AttributeScopes`.
+    static func tokenize(_ markup: String, stylesheet: HighlightStylesheet) -> Tokenized {
+        let text = trimWhitespaceAndNewlines(markup)
+        guard !text.isEmpty else {
+            return Tokenized(text: "", runs: [])
+        }
+        let utf8 = text.utf8
+        // The element chain from the root down, the root being the
+        // `<code class="hljs">` a theme's `.hljs` rule colours.
+        var elements: [HighlightStylesheet.Element] = [HighlightStylesheet.rootElement]
+        var styles: [HighlightStylesheet.Style] = [stylesheet.rootStyle]
+
+        var fullText = ""
+        fullText.reserveCapacity(utf8.count)
+        var runs: [HighlightRun] = []
+        var activeStyle: HighlightStylesheet.Style?
+        var runText = ""
+        var utf16Offset = 0
+
+        @inline(__always)
+        func emitCurrentRun() {
+            guard let style = activeStyle, !runText.isEmpty else { return }
+            let count = runText.utf16.count
+            fullText.append(runText)
+            runs.append(
+                HighlightRun(
+                    text: runText,
+                    utf16Range: utf16Offset..<(utf16Offset + count),
+                    foregroundColor: style.color,
+                    isUnderlined: style.underline
+                )
+            )
+            utf16Offset += count
+            runText = ""
+        }
+
+        @inline(__always)
+        func appendSlice(_ slice: Substring, style: HighlightStylesheet.Style) {
+            guard !slice.isEmpty else { return }
+            if let current = activeStyle, current != style {
+                emitCurrentRun()
+            }
+            activeStyle = style
+            runText.append(contentsOf: slice)
+        }
+
+        @inline(__always)
+        func appendDecoded(_ decoded: String, style: HighlightStylesheet.Style) {
+            if let current = activeStyle, current != style {
+                emitCurrentRun()
+            }
+            activeStyle = style
+            runText.append(decoded)
+        }
+
+        var index = utf8.startIndex
+        let end = utf8.endIndex
+        var chunkStart = index
+        var hasUnclosedAngle = false
+
+        @inline(__always)
+        func flushChunk(upTo position: String.UTF8View.Index) {
+            guard chunkStart < position else { return }
+            appendSlice(text[chunkStart..<position], style: styles[styles.count - 1])
+            chunkStart = position
+        }
+
+        while index < end {
+            let byte = utf8[index]
+            if byte == 0x3C && !hasUnclosedAngle {
+                var cursor = utf8.index(after: index)
+                while cursor < end && utf8[cursor] != 0x3E {
+                    utf8.formIndex(after: &cursor)
+                }
+                if cursor < end {
+                    flushChunk(upTo: index)
+                    let tagStart = utf8.index(after: index)
+                    let tag = text[tagStart..<cursor]
+                    if tagStart < cursor && utf8[tagStart] == 0x2F {
+                        if isClosingSpanTag(tag), elements.count > 1 {
+                            elements.removeLast()
+                            styles.removeLast()
+                        }
+                    } else if tag.hasPrefix("span") {
+                        let element = HighlightStylesheet.Element(
+                            tag: "span",
+                            classes: classes(in: tag)
+                        )
+                        elements.append(element)
+                        styles.append(
+                            stylesheet.style(for: elements, inheriting: styles[styles.count - 1])
+                        )
+                    }
+                    // Any other tag is not highlight.js's and carries nothing.
+                    index = utf8.index(after: cursor)
+                    chunkStart = index
+                    continue
+                } else {
+                    hasUnclosedAngle = true
+                }
+            } else if byte == 0x26 {
+                var cursor = utf8.index(after: index)
+                var distance = 1
+                var semicolon: String.UTF8View.Index?
+                while cursor < end && distance <= 10 {
+                    let candidate = utf8[cursor]
+                    if candidate == 0x3B {
+                        semicolon = cursor
+                        break
+                    }
+                    if candidate == 0x3C || candidate == 0x26 || candidate >= 0x80 {
+                        break
+                    }
+                    utf8.formIndex(after: &cursor)
+                    distance += 1
+                }
+                if let semicolon,
+                   let decoded = entity(text[utf8.index(after: index)..<semicolon]) {
+                    flushChunk(upTo: index)
+                    appendDecoded(decoded, style: styles[styles.count - 1])
+                    index = utf8.index(after: semicolon)
+                    chunkStart = index
+                    continue
+                }
+            }
+            utf8.formIndex(after: &index)
+        }
+        flushChunk(upTo: end)
+        emitCurrentRun()
+        return Tokenized(text: fullText, runs: runs)
+    }
+
     /// The attributed string for highlight.js's `value` under `css`: the
     /// markup's ends trimmed as whitespace, every entity decoded, colour
     /// and underline the stylesheet's, and no font — the font is the
     /// caller's.
     static func attributedString(_ markup: String, css: String) -> AttributedString {
-        let stylesheet = HighlightStylesheet(css: css)
-        let text = markup.trimmingCharacters(in: .whitespacesAndNewlines)
-        let output = NSMutableAttributedString()
-        // The element chain from the root down, the root being the
-        // `<code class="hljs">` a theme's `.hljs` rule colours.
-        var elements: [HighlightStylesheet.Element] = [.init(tag: "code", classes: ["hljs"])]
-        var styles: [HighlightStylesheet.Style] = [stylesheet.style(for: elements, inheriting: nil)]
-        var pending = ""
-        func flush() {
-            guard !pending.isEmpty else { return }
-            output.append(NSAttributedString(string: pending, attributes: styles[styles.count - 1].attributes))
-            pending = ""
-        }
-        var index = text.startIndex
-        while index < text.endIndex {
-            let character = text[index]
-            if character == "<", let close = text[index...].firstIndex(of: ">") {
-                let tag = text[text.index(after: index)..<close]
-                if tag.hasPrefix("/") {
-                    if tag.dropFirst().trimmingCharacters(in: .whitespaces) == "span", elements.count > 1 {
-                        flush()
-                        elements.removeLast()
-                        styles.removeLast()
-                    }
-                } else if tag.hasPrefix("span") {
-                    flush()
-                    let element = HighlightStylesheet.Element(tag: "span", classes: classes(in: tag))
-                    elements.append(element)
-                    styles.append(stylesheet.style(for: elements, inheriting: styles[styles.count - 1]))
-                }
-                // Any other tag is not highlight.js's and carries nothing.
-                index = text.index(after: close)
-            } else if character == "&",
-                      let semicolon = text[index...].firstIndex(of: ";"),
-                      text.distance(from: index, to: semicolon) <= 10,
-                      let decoded = entity(text[text.index(after: index)..<semicolon]) {
-                pending.append(decoded)
-                index = text.index(after: semicolon)
-            } else {
-                pending.append(character)
-                index = text.index(after: index)
+        let tokenized = tokenize(markup, stylesheet: HighlightStylesheet(css: css))
+        return attributedString(text: tokenized.text, runs: tokenized.runs)
+    }
+
+    /// Builds an `AttributedString` from already-resolved token runs.
+    static func attributedString(text: String, runs: [HighlightRun]) -> AttributedString {
+        guard !text.isEmpty else { return AttributedString() }
+        let output = NSMutableAttributedString(string: text)
+        output.beginEditing()
+        for run in runs {
+            guard run.foregroundColor != nil || run.isUnderlined else { continue }
+            var attributes: [NSAttributedString.Key: Any] = [:]
+            if let color = run.foregroundColor {
+                attributes[.foregroundColor] = color
             }
+            if run.isUnderlined {
+                attributes[.underlineStyle] = NSUnderlineStyle.single.rawValue
+            }
+            output.setAttributes(
+                attributes,
+                range: NSRange(location: run.utf16Range.lowerBound, length: run.utf16Range.count)
+            )
         }
-        flush()
+        output.endEditing()
 #if canImport(AppKit)
         return (try? AttributedString(output, including: \.appKit)) ?? AttributedString(output.string)
 #else
@@ -74,14 +190,148 @@ enum HighlightMarkup {
 #endif
     }
 
+    private static func trimWhitespaceAndNewlines(_ markup: String) -> Substring {
+        let utf8 = markup.utf8
+        var start = utf8.startIndex
+        var end = utf8.endIndex
+        while start < end && isASCIIWhitespace(utf8[start]) {
+            utf8.formIndex(after: &start)
+        }
+        while end > start {
+            let previous = utf8.index(before: end)
+            if isASCIIWhitespace(utf8[previous]) {
+                end = previous
+            } else {
+                break
+            }
+        }
+        guard start < end else { return markup[start..<end] }
+        if utf8[start] < 0x80 && utf8[utf8.index(before: end)] < 0x80 {
+            return markup[start..<end]
+        }
+        let scalars = markup.unicodeScalars
+        var scalarStart = start
+        var scalarEnd = end
+        while scalarStart < scalarEnd && isWhitespaceOrNewline(scalars[scalarStart]) {
+            scalars.formIndex(after: &scalarStart)
+        }
+        while scalarEnd > scalarStart {
+            let previous = scalars.index(before: scalarEnd)
+            if isWhitespaceOrNewline(scalars[previous]) {
+                scalarEnd = previous
+            } else {
+                break
+            }
+        }
+        return markup[scalarStart..<scalarEnd]
+    }
+
+    @inline(__always)
+    private static func isASCIIWhitespace(_ byte: UInt8) -> Bool {
+        byte == 0x20 || (byte >= 0x09 && byte <= 0x0D)
+    }
+
+    /// Matches Foundation's `CharacterSet.whitespacesAndNewlines` across all
+    /// Unicode scalars (Unicode `White_Space` plus `U+200B`) without bridging.
+    @inline(__always)
+    private static func isWhitespaceOrNewline(_ scalar: Unicode.Scalar) -> Bool {
+        scalar.properties.isWhitespace || scalar.value == 0x200B
+    }
+
+    @inline(__always)
+    private static func isClosingSpanTag(_ tag: Substring) -> Bool {
+        if tag == "/span" { return true }
+        let scalars = tag.unicodeScalars
+        var start = scalars.index(after: scalars.startIndex)
+        var end = scalars.endIndex
+        while start < end && isWhitespace(scalars[start]) {
+            scalars.formIndex(after: &start)
+        }
+        while end > start {
+            let previous = scalars.index(before: end)
+            if isWhitespace(scalars[previous]) {
+                end = previous
+            } else {
+                break
+            }
+        }
+        return tag[start..<end] == "span"
+    }
+
+    /// Matches Foundation's `CharacterSet.whitespaces` (`U+0009`, `U+0020`,
+    /// `U+200B`, and Unicode category `Zs`).
+    @inline(__always)
+    private static func isWhitespace(_ scalar: Unicode.Scalar) -> Bool {
+        scalar.value == 0x20
+            || scalar.value == 0x09
+            || scalar.value == 0x200B
+            || scalar.properties.generalCategory == .spaceSeparator
+    }
+
     /// The classes of an opening tag's `class` attribute, either quote.
     private static func classes(in tag: Substring) -> [String] {
-        guard let attribute = tag.range(of: "class=") else { return [] }
-        let afterEquals = tag[attribute.upperBound...]
-        guard let quote = afterEquals.first, quote == "\"" || quote == "'" else { return [] }
-        let value = afterEquals.dropFirst()
-        guard let end = value.firstIndex(of: quote) else { return [] }
-        return value[..<end].split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "\n" }).map(String.init)
+        let utf8 = tag.utf8
+        let end = utf8.endIndex
+        var cursor = utf8.startIndex
+        // Search for ASCII "class=" without bridging to Foundation.
+        var afterEquals: String.UTF8View.Index?
+        while cursor < end {
+            if utf8[cursor] == 0x63 {
+                let c1 = utf8.index(after: cursor)
+                if c1 < end && utf8[c1] == 0x6C {
+                    let c2 = utf8.index(after: c1)
+                    if c2 < end && utf8[c2] == 0x61 {
+                        let c3 = utf8.index(after: c2)
+                        if c3 < end && utf8[c3] == 0x73 {
+                            let c4 = utf8.index(after: c3)
+                            if c4 < end && utf8[c4] == 0x73 {
+                                let c5 = utf8.index(after: c4)
+                                if c5 < end && utf8[c5] == 0x3D {
+                                    afterEquals = utf8.index(after: c5)
+                                    break
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            utf8.formIndex(after: &cursor)
+        }
+        guard let quoteIndex = afterEquals, quoteIndex < end else { return [] }
+        let quote = utf8[quoteIndex]
+        guard quote == 0x22 || quote == 0x27 else { return [] }
+        let valueStart = utf8.index(after: quoteIndex)
+        var quoteEnd = valueStart
+        var hasSeparator = false
+        while quoteEnd < end {
+            let byte = utf8[quoteEnd]
+            if byte == quote { break }
+            if byte == 0x20 || byte == 0x09 || byte == 0x0A { hasSeparator = true }
+            utf8.formIndex(after: &quoteEnd)
+        }
+        guard quoteEnd < end else { return [] }
+        if !hasSeparator {
+            return valueStart < quoteEnd ? [String(tag[valueStart..<quoteEnd])] : []
+        }
+        var result: [String] = []
+        var tokenStart = valueStart
+        var position = valueStart
+        while position < quoteEnd {
+            let byte = utf8[position]
+            if byte == 0x20 || byte == 0x09 || byte == 0x0A {
+                if tokenStart < position {
+                    result.append(String(tag[tokenStart..<position]))
+                }
+                position = utf8.index(after: position)
+                tokenStart = position
+            } else {
+                utf8.formIndex(after: &position)
+            }
+        }
+        if tokenStart < quoteEnd {
+            result.append(String(tag[tokenStart..<quoteEnd]))
+        }
+        return result
     }
 
     /// The character for an entity's name, without its `&` and `;`: the
@@ -105,42 +355,36 @@ enum HighlightMarkup {
                 value = UInt32(number)
             }
             guard let value, let scalar = Unicode.Scalar(value) else { return nil }
-            return String(Character(scalar))
+            return String(scalar)
         }
     }
 }
 
-/// A stylesheet's colour and underline rules, in the shape the themes
+/// An immutable stylesheet's colour and underline rules, in the shape the themes
 /// ship: minified rules over `hljs-` classes, a few compound
 /// (`.hljs-title.class_`) or descendant (`.hljs-meta .hljs-string`)
 /// selectors among them, and whatever a custom stylesheet adds — comments,
-/// whitespace, `@media` blocks, `!important`. A rule keeps what an
-/// attributed string can carry and this package hands on: `color` and
-/// `text-decoration: underline`. Font weight and style are the caller's
-/// font's, as they were when the importer's fonts were stripped, and the
-/// layout properties never reached the text.
-struct HighlightStylesheet {
-    struct Element {
+/// whitespace, `@media` blocks, `!important`. A rule keeps what a run and an
+/// attributed string carry: `color` and `text-decoration: underline`. Font
+/// weight and style are the caller's font's, and layout properties never reach
+/// the text.
+final class HighlightStylesheet: Sendable {
+    struct Element: Sendable {
         let tag: String
         let classes: [String]
     }
 
-    struct Style {
+    struct Style: Equatable, Sendable {
         var color: HighlightPlatformColor?
         var underline: Bool
-
-        var attributes: [NSAttributedString.Key: Any] {
-            var attributes: [NSAttributedString.Key: Any] = [:]
-            if let color { attributes[.foregroundColor] = color }
-            if underline { attributes[.underlineStyle] = NSUnderlineStyle.single.rawValue }
-            return attributes
-        }
     }
+
+    static let rootElement = Element(tag: "code", classes: ["hljs"])
 
     /// One compound selector: the classes and tag an element must carry.
     /// An id, a pseudo-class or -element, or an attribute makes the part
     /// unmatchable, since no element here has one.
-    private struct Part {
+    private struct Part: Sendable {
         var classes: [String] = []
         var tag: String?
         var unmatchable = false
@@ -150,9 +394,15 @@ struct HighlightStylesheet {
             if let tag, tag != element.tag { return false }
             return classes.allSatisfy { element.classes.contains($0) }
         }
+
+        var estimatedBytes: Int {
+            MemoryLayout<Self>.stride
+                + (tag?.utf8.count ?? 0)
+                + classes.reduce(0) { $0 + MemoryLayout<String>.stride + $1.utf8.count }
+        }
     }
 
-    private struct Rule {
+    private struct Rule: Sendable {
         /// Outermost first; the last part is the element's own.
         let parts: [Part]
         let specificity: Int
@@ -172,9 +422,18 @@ struct HighlightStylesheet {
             }
             return true
         }
+
+        var estimatedBytes: Int {
+            MemoryLayout<Self>.stride
+                + (color == nil ? 0 : 64)
+                + parts.reduce(0) { $0 + $1.estimatedBytes }
+        }
     }
 
-    private let rules: [Rule]
+    private let rulesByClass: [String: [Rule]]
+    private let tagOrUniversalRules: [Rule]
+    let rootStyle: Style
+    let estimatedBytes: Int
 
     init(css: String) {
         var text = css
@@ -185,7 +444,10 @@ struct HighlightStylesheet {
             }
             text.removeSubrange(start.lowerBound..<end.upperBound)
         }
-        var rules: [Rule] = []
+        var rulesByClass: [String: [Rule]] = [:]
+        var tagOrUniversalRules: [Rule] = []
+        var nextOrder = 0
+        var estimatedBytes = MemoryLayout<HighlightStylesheet>.stride
         var index = text.startIndex
         while let open = text[index...].firstIndex(of: "{") {
             let selectors = text[index..<open].trimmingCharacters(in: .whitespacesAndNewlines)
@@ -228,30 +490,83 @@ struct HighlightStylesheet {
                     let specificity = parts.reduce(0) { total, part in
                         total + part.classes.count * 100 + (part.tag == nil ? 0 : 1)
                     }
-                    rules.append(Rule(parts: parts, specificity: specificity, order: rules.count, color: color, underline: underline))
+                    let rule = Rule(
+                        parts: parts,
+                        specificity: specificity,
+                        order: nextOrder,
+                        color: color,
+                        underline: underline
+                    )
+                    nextOrder += 1
+                    if parts.contains(where: { $0.unmatchable }) { continue }
+                    estimatedBytes += rule.estimatedBytes
+                    if let key = parts.last?.classes.first {
+                        if rulesByClass[key] == nil {
+                            estimatedBytes += MemoryLayout<String>.stride + key.utf8.count
+                        }
+                        rulesByClass[key, default: []].append(rule)
+                    } else {
+                        tagOrUniversalRules.append(rule)
+                    }
                 }
             }
             index = text.index(after: close)
         }
-        self.rules = rules
+        self.rulesByClass = rulesByClass
+        self.tagOrUniversalRules = tagOrUniversalRules
+        self.estimatedBytes = estimatedBytes
+        self.rootStyle = Self.resolveStyle(
+            for: [Self.rootElement],
+            inheriting: nil,
+            rulesByClass: rulesByClass,
+            tagOrUniversalRules: tagOrUniversalRules
+        )
     }
 
     /// The style of the innermost element of `elements`: for each property,
     /// the matching rule of highest specificity, the latest among equals,
     /// and the parent's where no rule sets it.
     func style(for elements: [Element], inheriting parent: Style?) -> Style {
+        Self.resolveStyle(
+            for: elements,
+            inheriting: parent,
+            rulesByClass: rulesByClass,
+            tagOrUniversalRules: tagOrUniversalRules
+        )
+    }
+
+    private static func resolveStyle(
+        for elements: [Element],
+        inheriting parent: Style?,
+        rulesByClass: [String: [Rule]],
+        tagOrUniversalRules: [Rule]
+    ) -> Style {
         var style = Style(color: parent?.color, underline: parent?.underline ?? false)
-        var colorRank = -1
-        var underlineRank = -1
-        for rule in rules where rule.matches(elements) {
-            let rank = rule.specificity * 10_000 + rule.order
-            if let color = rule.color, rank > colorRank {
-                style.color = color
-                colorRank = rank
+        guard let element = elements.last else { return style }
+        var colorRank = (-1, -1)
+        var underlineRank = (-1, -1)
+
+        @inline(__always)
+        func apply(_ candidates: [Rule]) {
+            for rule in candidates where rule.matches(elements) {
+                let rank = (rule.specificity, rule.order)
+                if let color = rule.color, rank > colorRank {
+                    style.color = color
+                    colorRank = rank
+                }
+                if rule.underline, rank > underlineRank {
+                    style.underline = true
+                    underlineRank = rank
+                }
             }
-            if rule.underline, rank > underlineRank {
-                style.underline = true
-                underlineRank = rank
+        }
+
+        if !tagOrUniversalRules.isEmpty {
+            apply(tagOrUniversalRules)
+        }
+        for className in element.classes {
+            if let candidates = rulesByClass[className] {
+                apply(candidates)
             }
         }
         return style
